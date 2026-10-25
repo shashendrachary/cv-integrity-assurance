@@ -1,0 +1,49 @@
+
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Virtual environments
+.venv/
+.venv312/
+venv/
+env/
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Generated logs and reports; retain directory placeholders
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep
+
+# Dataset contents; retain empty structure
+dataset/images/*
+!dataset/images/.gitkeep
+dataset/labels/*
+!dataset/labels/.gitkeep
+
+# Model weights and other large model artifacts
+models/*
+!models/.gitkeep
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Editor and operating-system files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp

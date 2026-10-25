@@ -1,0 +1,37 @@
+# Paths are relative to the project root. This file is a placeholder for future modules.
+paths:
+  images: dataset/images
+  labels: dataset/labels
+  models: models
+  model_registry: models/model_registry.json
+  reports: reports
+  logs: logs
+
+# Integrity options reserved for later checks.
+integrity:
+  dataset_hashing_enabled: false
+  label_validation_enabled: false
+  hash_algorithm: sha256
+
+model:
+  verification_enabled: true
+
+inference:
+  enabled: true
+  device: cpu
+  confidence: 0.25
+
+anomaly_detection:
+  enabled: true
+  minimum_width: 16
+  minimum_height: 16
+  maximum_width: 10000
+  maximum_height: 10000
+  minimum_aspect_ratio: 0.1
+  maximum_aspect_ratio: 10.0
+  minimum_mean_brightness: 5.0
+  maximum_mean_brightness: 250.0
+  minimum_laplacian_variance: 5.0
+
+provenance:
+  enabled: true

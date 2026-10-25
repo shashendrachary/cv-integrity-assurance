@@ -1,0 +1,1 @@
+"""Future assurance report generation."""
