@@ -1,12 +1,19 @@
 """Temporary-file tests for model baseline registration and verification."""
 
 import hashlib
+import io
+import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
+import assurance
+from src.integrity.data_checks import DataCheckResult
 from src.model.integrity import (
     ModelInferenceBlocked,
     ModelRegistryError,
@@ -49,6 +56,170 @@ class ModelIntegrityTests(unittest.TestCase):
 
         self.assertEqual(result.status, "VERIFIED")
         self.assertEqual(result.expected_hash, result.actual_hash)
+
+    def test_relative_model_path_resolves_from_project_root_outside_cwd(self) -> None:
+        project_root = self.root / "project"
+        model_path = project_root / "models" / "demo-model.bin"
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"project-relative model bytes")
+        registry_path = model_path.parent / "model_registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "models": {
+                        "demo-model": {
+                            "model_id": "demo-model",
+                            "file_path": "models/demo-model.bin",
+                            "expected_hash": hashlib.sha256(
+                                model_path.read_bytes()
+                            ).hexdigest(),
+                            "registered_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        unrelated_directory = self.root / "unrelated"
+        unrelated_directory.mkdir()
+        original_directory = Path.cwd()
+
+        try:
+            os.chdir(unrelated_directory)
+            result = verify_model(
+                "demo-model", registry_path, project_root=project_root
+            )
+        finally:
+            os.chdir(original_directory)
+
+        self.assertEqual(result.status, "VERIFIED")
+        self.assertEqual(Path(result.file_path or ""), model_path.resolve())
+
+    def test_absolute_model_path_remains_supported(self) -> None:
+        register_model("demo-model", self.model_file, self.registry_path)
+
+        result = verify_model(
+            "demo-model", self.registry_path, project_root=self.root / "other-root"
+        )
+
+        self.assertEqual(result.status, "VERIFIED")
+        self.assertEqual(Path(result.file_path or ""), self.model_file.resolve())
+
+    def test_missing_relative_model_path_requires_actionable_review(self) -> None:
+        project_root = self.root / "project"
+        registry_path = self.root / "registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "models": {
+                        "demo-model": {
+                            "model_id": "demo-model",
+                            "file_path": "models/missing.bin",
+                            "expected_hash": hashlib.sha256(b"expected").hexdigest(),
+                            "registered_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = verify_model(
+            "demo-model", registry_path, project_root=project_root
+        )
+
+        self.assertEqual(result.status, "REVIEW REQUIRED")
+        self.assertIn(str(project_root / "models" / "missing.bin"), result.reason)
+        self.assertIn("Check the registry file_path", result.reason)
+
+    def test_cli_resolves_registry_and_model_paths_outside_cwd(self) -> None:
+        project_root = self.root / "project"
+        model_path = project_root / "models" / "demo-model.bin"
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"CLI-relative model bytes")
+        registry_path = model_path.parent / "model_registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "models": {
+                        "demo-model": {
+                            "model_id": "demo-model",
+                            "file_path": "models/demo-model.bin",
+                            "expected_hash": hashlib.sha256(
+                                model_path.read_bytes()
+                            ).hexdigest(),
+                            "registered_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (project_root / "config.yaml").write_text(
+            "paths:\n  model_registry: models/model_registry.json\n",
+            encoding="utf-8",
+        )
+        unrelated_directory = self.root / "unrelated"
+        unrelated_directory.mkdir()
+        output = io.StringIO()
+        original_directory = Path.cwd()
+
+        try:
+            os.chdir(unrelated_directory)
+            with (
+                patch("assurance.PROJECT_ROOT", project_root),
+                patch("assurance.configure_logging"),
+                redirect_stdout(output),
+            ):
+                result = assurance.main(["verify-model", "--id", "demo-model"])
+        finally:
+            os.chdir(original_directory)
+
+        self.assertEqual(result, 0)
+        self.assertIn("Status: VERIFIED", output.getvalue())
+        self.assertIn(f"File: {model_path.resolve()}", output.getvalue())
+
+    def test_cli_resolves_relative_dataset_overrides_from_project_root(self) -> None:
+        project_root = self.root / "project"
+        project_root.mkdir()
+        (project_root / "config.yaml").write_text(
+            "paths:\n  images: configured-images\n  labels: configured-labels\n",
+            encoding="utf-8",
+        )
+        unrelated_directory = self.root / "unrelated"
+        unrelated_directory.mkdir()
+        scan = patch(
+            "assurance.scan_dataset", return_value=DataCheckResult()
+        )
+        original_directory = Path.cwd()
+
+        try:
+            os.chdir(unrelated_directory)
+            with (
+                patch("assurance.PROJECT_ROOT", project_root),
+                patch("assurance.configure_logging"),
+                scan as scan_dataset,
+            ):
+                result = assurance.main(
+                    [
+                        "check-data",
+                        "--images-dir",
+                        "override-images",
+                        "--labels-dir",
+                        "override-labels",
+                    ]
+                )
+        finally:
+            os.chdir(original_directory)
+
+        self.assertEqual(result, 0)
+        scan_dataset.assert_called_once_with(
+            project_root / "override-images",
+            project_root / "override-labels",
+        )
 
     def test_modified_model_file_is_suspicious(self) -> None:
         register_model("demo-model", self.model_file, self.registry_path)

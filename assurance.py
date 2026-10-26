@@ -257,7 +257,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 return 0
 
-            result = verify_model(arguments.id, registry_path)
+            result = verify_model(
+                arguments.id, registry_path, project_root=PROJECT_ROOT
+            )
             print(format_verification(result))
             logger.info("Model verification %s: %s", result.status, arguments.id)
             return 0 if result.status == "VERIFIED" else 2
@@ -407,8 +409,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 PROJECT_ROOT / "config.yaml", PROJECT_ROOT
             )
             result = scan_dataset(
-                arguments.images_dir or configured_images,
-                arguments.labels_dir or configured_labels,
+                _project_path(arguments.images_dir)
+                if arguments.images_dir is not None
+                else configured_images,
+                _project_path(arguments.labels_dir)
+                if arguments.labels_dir is not None
+                else configured_labels,
             )
         except (OSError, ValueError, ImageDependencyError) as error:
             logger.error("Data check could not be completed: %s", error)

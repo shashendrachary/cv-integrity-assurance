@@ -217,8 +217,17 @@ def load_model_registry_path(config_path: Path, project_root: Path) -> Path:
     return registry_path if registry_path.is_absolute() else project_root / registry_path
 
 
-def verify_model(model_id: str, registry_path: Path) -> ModelVerificationResult:
-    """Compare the registered baseline with the current bytes at its file path."""
+def verify_model(
+    model_id: str,
+    registry_path: Path,
+    *,
+    project_root: Path | None = None,
+) -> ModelVerificationResult:
+    """Compare the registered baseline with the current bytes at its file path.
+
+    Relative model paths in the registry are resolved from the project root,
+    rather than the caller's current working directory.
+    """
     try:
         _validate_model_id(model_id)
     except ValueError as error:
@@ -243,6 +252,9 @@ def verify_model(model_id: str, registry_path: Path) -> ModelVerificationResult:
         )
 
     model_path = Path(registration["file_path"])
+    if not model_path.is_absolute():
+        root = project_root or Path(__file__).resolve().parents[2]
+        model_path = (root / model_path).resolve()
     expected_hash = registration["expected_hash"]
     try:
         actual_hash = sha256_file(model_path)
@@ -252,7 +264,8 @@ def verify_model(model_id: str, registry_path: Path) -> ModelVerificationResult:
             expected_hash,
             None,
             "REVIEW REQUIRED",
-            f"Model file is missing or cannot be read: {error}",
+            f"Model file is missing or cannot be read at {model_path}: {error}. "
+            "Check the registry file_path and ensure the model file exists and is readable.",
             str(model_path),
         )
 
