@@ -1,5 +1,6 @@
 """Offline tests for image anomalies and integrity-gated YOLO inference."""
 
+import json
 import shutil
 import tempfile
 import unittest
@@ -100,6 +101,56 @@ class InferenceTests(unittest.TestCase):
 
         self.assertEqual(result.status, "SUSPICIOUS")
         loader.assert_not_called()
+
+    def test_tampered_model_is_blocked_without_affecting_other_registered_model(self) -> None:
+        second_model_path = self.root / "second-synthetic-model.bin"
+        second_model_path.write_bytes(b"independent synthetic model bytes")
+        first_registration = register_model(
+            "first-model", self.model_path, self.registry_path
+        )
+        second_registration = register_model(
+            "second-model", second_model_path, self.registry_path
+        )
+        self.model_path.write_bytes(b"changed first model bytes")
+        tampered_loader = self.fake_loader()
+
+        tampered_result = run_inference(
+            self.image_path,
+            "first-model",
+            self.registry_path,
+            anomaly_thresholds=self.thresholds,
+            model_loader=tampered_loader,
+        )
+
+        self.assertEqual(tampered_result.status, "SUSPICIOUS")
+        tampered_loader.assert_not_called()
+
+        independent_loader = self.fake_loader()
+        independent_result = run_inference(
+            self.image_path,
+            "second-model",
+            self.registry_path,
+            anomaly_thresholds=self.thresholds,
+            model_loader=independent_loader,
+        )
+
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        self.assertEqual(independent_result.status, "VERIFIED")
+        independent_loader.assert_called_once()
+        self.assertEqual(
+            independent_result.model_verification.expected_hash,
+            second_registration["expected_hash"],
+        )
+        self.assertEqual(
+            independent_result.model_verification.actual_hash,
+            second_registration["expected_hash"],
+        )
+        self.assertEqual(
+            registry["models"]["first-model"], first_registration
+        )
+        self.assertEqual(
+            registry["models"]["second-model"], second_registration
+        )
 
     def test_integrity_check_precedes_loading_a_verified_private_snapshot(self) -> None:
         self.register_model()

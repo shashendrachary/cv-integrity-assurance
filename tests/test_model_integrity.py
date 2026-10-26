@@ -355,6 +355,38 @@ class ModelIntegrityTests(unittest.TestCase):
         self.assertIsNotNone(result.expected_hash)
         self.assertIsNone(result.actual_hash)
 
+    def test_missing_model_does_not_affect_other_registered_model(self) -> None:
+        missing_model = self.root / "missing-after-registration.bin"
+        intact_model = self.root / "intact-model.bin"
+        missing_model.write_bytes(b"model that will be removed")
+        intact_model.write_bytes(b"intact independent model")
+        missing_registration = register_model(
+            "missing-model", missing_model, self.registry_path
+        )
+        intact_registration = register_model(
+            "intact-model", intact_model, self.registry_path
+        )
+        registry_before = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        missing_model.unlink()
+
+        missing_result = verify_model("missing-model", self.registry_path)
+        intact_result = verify_model("intact-model", self.registry_path)
+        registry_after = json.loads(self.registry_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(missing_result.status, "REVIEW REQUIRED")
+        self.assertIsNone(missing_result.actual_hash)
+        self.assertEqual(intact_result.status, "VERIFIED")
+        self.assertEqual(
+            intact_result.expected_hash, intact_registration["expected_hash"]
+        )
+        self.assertEqual(registry_after, registry_before)
+        self.assertEqual(
+            registry_after["models"]["missing-model"], missing_registration
+        )
+        self.assertEqual(
+            registry_after["models"]["intact-model"], intact_registration
+        )
+
     def test_unknown_id_and_missing_registry_require_review(self) -> None:
         unknown_result = verify_model("unknown", self.registry_path)
         missing_registry_result = verify_model(
