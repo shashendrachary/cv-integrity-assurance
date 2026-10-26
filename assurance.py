@@ -18,6 +18,7 @@ from src.database.postgres import (
     DatabaseOperationError,
     initialize_provenance_table,
     load_database_settings,
+    migrate_project_scope_schema,
 )
 from src.model.integrity import (
     ModelRegistryError,
@@ -163,6 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="create the PostgreSQL inference provenance table if absent",
         description="Explicitly initialize the non-destructive provenance schema.",
     )
+    commands.add_parser(
+        "migrate-db",
+        help="explicitly migrate PostgreSQL provenance to project-scoped schema",
+        description=(
+            "Run the versioned project-scope migration. Back up the database first."
+        ),
+    )
     assessment_parser = commands.add_parser(
         "assess",
         help="run inference, record available evidence, and generate a PDF report",
@@ -243,7 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{project_context.organization_id}/{project_context.project_id}"
         )
 
-    if arguments.command == "init-db":
+    if arguments.command in {"init-db", "migrate-db"}:
         try:
             settings = load_database_settings(PROJECT_ROOT / ".env")
             if settings is None:
@@ -251,6 +259,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "PostgreSQL settings are not configured. Set POSTGRES_DB and "
                     "POSTGRES_USER in the environment or project .env file."
                 )
+            if arguments.command == "migrate-db":
+                version = migrate_project_scope_schema(settings)
+                print(
+                    "Project-scoped PostgreSQL schema is at version "
+                    f"{version} (existing provenance preserved)."
+                )
+                return 0
             initialize_provenance_table(settings)
         except (DatabaseNotConfigured, DatabaseOperationError) as error:
             print(f"Database initialization failed: {error}", file=sys.stderr)
