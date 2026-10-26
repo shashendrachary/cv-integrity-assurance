@@ -30,9 +30,11 @@ dataset/images/*
 dataset/labels/*
 !dataset/labels/.gitkeep
 
+
 # Model weights and other large model artifacts
 models/*
 !models/.gitkeep
+!models/model_registry.json
 *.pt
 *.pth
 *.onnx
