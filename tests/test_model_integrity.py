@@ -57,6 +57,120 @@ class ModelIntegrityTests(unittest.TestCase):
         self.assertEqual(result.status, "VERIFIED")
         self.assertEqual(result.expected_hash, result.actual_hash)
 
+    def test_two_model_ids_keep_independent_registrations_and_verify(self) -> None:
+        first_model = self.root / "first-model.bin"
+        second_model = self.root / "second-model.bin"
+        first_model.write_bytes(b"first model bytes")
+        second_model.write_bytes(b"second model bytes")
+
+        first_registration = register_model(
+            "first-model", first_model, self.registry_path
+        )
+        second_registration = register_model(
+            "second-model", second_model, self.registry_path
+        )
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            set(registry["models"]), {"first-model", "second-model"}
+        )
+        self.assertEqual(
+            registry["models"]["first-model"], first_registration
+        )
+        self.assertEqual(
+            registry["models"]["second-model"], second_registration
+        )
+        self.assertEqual(
+            verify_model("first-model", self.registry_path).status, "VERIFIED"
+        )
+        self.assertEqual(
+            verify_model("second-model", self.registry_path).status, "VERIFIED"
+        )
+
+    def test_verification_does_not_change_any_registration(self) -> None:
+        first_model = self.root / "first-model.bin"
+        second_model = self.root / "second-model.bin"
+        first_model.write_bytes(b"first model bytes")
+        second_model.write_bytes(b"second model bytes")
+        register_model("first-model", first_model, self.registry_path)
+        register_model("second-model", second_model, self.registry_path)
+        original_registry = self.registry_path.read_bytes()
+
+        self.assertEqual(
+            verify_model("first-model", self.registry_path).status, "VERIFIED"
+        )
+
+        self.assertEqual(self.registry_path.read_bytes(), original_registry)
+
+    def test_replacing_one_model_id_preserves_the_other_registration(self) -> None:
+        first_model = self.root / "first-model.bin"
+        first_replacement = self.root / "first-model-replacement.bin"
+        second_model = self.root / "second-model.bin"
+        first_model.write_bytes(b"first model bytes")
+        first_replacement.write_bytes(b"replacement model bytes")
+        second_model.write_bytes(b"second model bytes")
+        original_first = register_model(
+            "first-model", first_model, self.registry_path
+        )
+        original_second = register_model(
+            "second-model", second_model, self.registry_path
+        )
+
+        with self.assertRaisesRegex(ModelRegistryError, "Use --replace"):
+            register_model("first-model", first_replacement, self.registry_path)
+
+        replacement = register_model(
+            "first-model",
+            first_replacement,
+            self.registry_path,
+            replace=True,
+        )
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+
+        self.assertNotEqual(
+            replacement["expected_hash"], original_first["expected_hash"]
+        )
+        self.assertEqual(registry["models"]["first-model"], replacement)
+        self.assertEqual(registry["models"]["second-model"], original_second)
+        self.assertEqual(
+            verify_model("first-model", self.registry_path).expected_hash,
+            replacement["expected_hash"],
+        )
+        self.assertEqual(
+            verify_model("second-model", self.registry_path).expected_hash,
+            original_second["expected_hash"],
+        )
+
+    def test_legacy_yolo11n_model_id_remains_supported(self) -> None:
+        registration = register_model(
+            "yolo11n", self.model_file, self.registry_path
+        )
+
+        result = verify_model("yolo11n", self.registry_path)
+
+        self.assertEqual(result.status, "VERIFIED")
+        self.assertEqual(result.model_id, "yolo11n")
+        self.assertEqual(result.expected_hash, registration["expected_hash"])
+
+    def test_invalid_model_id_is_rejected_without_changing_registry(self) -> None:
+        registration = register_model(
+            "valid-model", self.model_file, self.registry_path
+        )
+        original_registry = self.registry_path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "Model ID must start"):
+            register_model("../invalid", self.model_file, self.registry_path)
+
+        result = verify_model("../invalid", self.registry_path)
+
+        self.assertEqual(result.status, "REVIEW REQUIRED")
+        self.assertIn("Model ID must start", result.reason)
+        self.assertEqual(self.registry_path.read_bytes(), original_registry)
+        self.assertEqual(
+            json.loads(original_registry)["models"]["valid-model"],
+            registration,
+        )
+
     def test_relative_model_path_resolves_from_project_root_outside_cwd(self) -> None:
         project_root = self.root / "project"
         model_path = project_root / "models" / "demo-model.bin"
