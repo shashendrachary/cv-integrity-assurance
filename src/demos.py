@@ -18,9 +18,11 @@ from src.vision.inference import run_inference
 def run_model_tampering_demo(
     model_id: str,
     registry_path: Path,
+    *,
+    project_root: Path | None = None,
 ) -> tuple[str, str, str, bool]:
     """Tamper with a temporary copy only and demonstrate inference blocking."""
-    original = verify_model(model_id, registry_path)
+    original = verify_model(model_id, registry_path, project_root=project_root)
     if original.status != "VERIFIED" or original.file_path is None:
         raise ValueError(
             f"Demo requires an intact registered model; current status is {original.status}."

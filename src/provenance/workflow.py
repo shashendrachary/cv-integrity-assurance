@@ -82,18 +82,24 @@ def run_assessment(
     database_settings: ConnectionSettings | None,
     database_note: str | None = None,
     model_loader: Any = None,
+    project_root: Path | None = None,
     inference_function: InferenceFunction = run_inference,
     record_inserter: RecordInserter = insert_provenance_record,
     report_generator: ReportGenerator = generate_pdf_report,
 ) -> AssessmentResult:
     """Run inference once, persist its evidence when available, then generate its PDF."""
+    inference_options: dict[str, Any] = {
+        "confidence": confidence,
+        "anomaly_thresholds": anomaly_thresholds,
+        "model_loader": model_loader,
+    }
+    if project_root is not None:
+        inference_options["project_root"] = project_root
     inference = inference_function(
         image_path,
         model_id,
         registry_path,
-        confidence=confidence,
-        anomaly_thresholds=anomaly_thresholds,
-        model_loader=model_loader,
+        **inference_options,
     )
 
     persistence_status = "not saved"

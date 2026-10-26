@@ -89,6 +89,7 @@ def run_inference(
     confidence: float = 0.25,
     anomaly_thresholds: AnomalyThresholds | None = None,
     model_loader: ModelLoader | None = None,
+    project_root: Path | None = None,
 ) -> InferenceRunResult:
     """Analyze an image, verify the exact registered model, then run local CPU detection."""
     if not 0 <= confidence <= 1:
@@ -111,7 +112,9 @@ def run_inference(
             confidence=confidence,
         )
 
-    verification = verify_model(model_id, registry_path)
+    verification = verify_model(
+        model_id, registry_path, project_root=project_root
+    )
     try:
         ensure_model_verified(verification)
     except ModelInferenceBlocked as error:

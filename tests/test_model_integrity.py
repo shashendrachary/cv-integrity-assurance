@@ -273,7 +273,14 @@ class ModelIntegrityTests(unittest.TestCase):
             encoding="utf-8",
         )
         (project_root / "config.yaml").write_text(
-            "paths:\n  model_registry: models/model_registry.json\n",
+            "project:\n"
+            "  organization_id: test-org\n"
+            "  project_id: test-project\n"
+            "paths:\n"
+            "  images: dataset/images\n"
+            "  labels: dataset/labels\n"
+            "  model_registry: models/model_registry.json\n"
+            "  reports: reports\n",
             encoding="utf-8",
         )
         unrelated_directory = self.root / "unrelated"
@@ -288,7 +295,15 @@ class ModelIntegrityTests(unittest.TestCase):
                 patch("assurance.configure_logging"),
                 redirect_stdout(output),
             ):
-                result = assurance.main(["verify-model", "--id", "demo-model"])
+                result = assurance.main(
+                    [
+                        "verify-model",
+                        "--id",
+                        "demo-model",
+                        "--project-config",
+                        "config.yaml",
+                    ]
+                )
         finally:
             os.chdir(original_directory)
 
@@ -300,7 +315,14 @@ class ModelIntegrityTests(unittest.TestCase):
         project_root = self.root / "project"
         project_root.mkdir()
         (project_root / "config.yaml").write_text(
-            "paths:\n  images: configured-images\n  labels: configured-labels\n",
+            "project:\n"
+            "  organization_id: test-org\n"
+            "  project_id: test-project\n"
+            "paths:\n"
+            "  images: configured-images\n"
+            "  labels: configured-labels\n"
+            "  model_registry: models/model_registry.json\n"
+            "  reports: reports\n",
             encoding="utf-8",
         )
         unrelated_directory = self.root / "unrelated"

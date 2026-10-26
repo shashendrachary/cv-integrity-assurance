@@ -1,4 +1,8 @@
-# Paths are relative to the project root. This file is a placeholder for future modules.
+# Resource paths are relative to the directory containing the selected config.
+project:
+  organization_id: local
+  project_id: default
+
 paths:
   images: dataset/images
   labels: dataset/labels

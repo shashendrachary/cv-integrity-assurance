@@ -10,7 +10,6 @@ from src.demos import run_data_integrity_demo, run_model_tampering_demo
 from src.integrity.data_checks import (
     ImageDependencyError,
     format_data_check,
-    load_dataset_paths,
     scan_dataset,
 )
 from src.anomaly.checks import load_inference_settings
@@ -23,13 +22,13 @@ from src.database.postgres import (
 from src.model.integrity import (
     ModelRegistryError,
     format_verification,
-    load_model_registry_path,
     register_model,
     verify_model,
 )
 from src.provenance.records import create_provenance_record, insert_provenance_record
 from src.provenance.workflow import run_assessment
-from src.reports.pdf_report import ReportGenerationError, load_report_directory
+from src.project_context import ProjectContext, ProjectContextError, load_project_context
+from src.reports.pdf_report import ReportGenerationError
 from src.vision.inference import format_inference_result, run_inference
 
 
@@ -84,6 +83,17 @@ def build_parser() -> argparse.ArgumentParser:
         description=f"Command-line foundation for {PROJECT_NAME}.",
     )
     commands = parser.add_subparsers(dest="command")
+
+    def add_project_config_argument(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--project-config",
+            type=Path,
+            help=(
+                "select a project configuration (relative paths use its directory; "
+                "default: project config.yaml)"
+            ),
+        )
+
     data_parser = commands.add_parser(
         "check-data",
         help="validate dataset images and YOLO labels",
@@ -99,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="override the configured label directory",
     )
+    add_project_config_argument(data_parser)
     register_parser = commands.add_parser(
         "register-model",
         help="register a model file's SHA-256 baseline",
@@ -116,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="explicitly replace an existing trusted baseline",
     )
+    add_project_config_argument(register_parser)
     verify_parser = commands.add_parser(
         "verify-model",
         help="verify a registered model file against its baseline",
@@ -127,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="override the registry path configured in config.yaml",
     )
+    add_project_config_argument(verify_parser)
     inference_parser = commands.add_parser(
         "infer",
         help="run integrity-gated local YOLO inference",
@@ -144,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="override the registry path configured in config.yaml",
     )
+    add_project_config_argument(inference_parser)
     commands.add_parser(
         "init-db",
         help="create the PostgreSQL inference provenance table if absent",
@@ -166,6 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="override the registry path configured in config.yaml",
     )
+    add_project_config_argument(assessment_parser)
     tamper_demo_parser = commands.add_parser(
         "demo-model-tampering",
         help="safely demonstrate model hash mismatch using a temporary copy",
@@ -180,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="override the registry path configured in config.yaml",
     )
+    add_project_config_argument(tamper_demo_parser)
     commands.add_parser(
         "demo-data-integrity",
         help="demonstrate image and YOLO-label findings with temporary files",
@@ -192,12 +208,41 @@ def _project_path(path: Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def _load_cli_project_context(project_config: Path | None) -> ProjectContext:
+    configuration_path = (
+        _project_path(project_config)
+        if project_config is not None
+        else PROJECT_ROOT / "config.yaml"
+    )
+    return load_project_context(configuration_path)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the foundation status, dataset check, or model-integrity command."""
     parser = build_parser()
     arguments = parser.parse_args(argv)
 
     logger = configure_logging()
+    project_context: ProjectContext | None = None
+    if arguments.command in {
+        "check-data",
+        "register-model",
+        "verify-model",
+        "infer",
+        "assess",
+        "demo-model-tampering",
+    }:
+        try:
+            project_context = _load_cli_project_context(arguments.project_config)
+        except ProjectContextError as error:
+            logger.error("Project configuration could not be loaded: %s", error)
+            print(f"Project configuration failed: {error}", file=sys.stderr)
+            return 2
+        print(
+            "Project context: "
+            f"{project_context.organization_id}/{project_context.project_id}"
+        )
+
     if arguments.command == "init-db":
         try:
             settings = load_database_settings(PROJECT_ROOT / ".env")
@@ -218,31 +263,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if arguments.command == "demo-model-tampering":
+        assert project_context is not None
         try:
-            configured_registry = load_model_registry_path(
-                PROJECT_ROOT / "config.yaml", PROJECT_ROOT
+            registry_path = (
+                project_context.resolve_path(arguments.registry)
+                if arguments.registry is not None
+                else project_context.model_registry
             )
-            registry_path = _project_path(
-                arguments.registry or configured_registry
+            run_model_tampering_demo(
+                arguments.id,
+                registry_path,
+                project_root=project_context.base_path,
             )
-            run_model_tampering_demo(arguments.id, registry_path)
         except (OSError, ValueError, ModelRegistryError, RuntimeError) as error:
             print(f"Model tampering demo failed: {error}", file=sys.stderr)
             return 2
         return 0
 
     if arguments.command in {"register-model", "verify-model"}:
+        assert project_context is not None
         try:
-            configured_registry = load_model_registry_path(
-                PROJECT_ROOT / "config.yaml", PROJECT_ROOT
-            )
-            registry_path = _project_path(
-                arguments.registry or configured_registry
+            registry_path = (
+                project_context.resolve_path(arguments.registry)
+                if arguments.registry is not None
+                else project_context.model_registry
             )
             if arguments.command == "register-model":
                 registration = register_model(
                     arguments.id,
-                    _project_path(arguments.path),
+                    project_context.resolve_path(arguments.path),
                     registry_path,
                     replace=arguments.replace,
                 )
@@ -258,7 +307,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
 
             result = verify_model(
-                arguments.id, registry_path, project_root=PROJECT_ROOT
+                arguments.id,
+                registry_path,
+                project_root=project_context.base_path,
             )
             print(format_verification(result))
             logger.info("Model verification %s: %s", result.status, arguments.id)
@@ -269,18 +320,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
 
     if arguments.command == "infer":
+        assert project_context is not None
         try:
-            configured_registry = load_model_registry_path(
-                PROJECT_ROOT / "config.yaml", PROJECT_ROOT
-            )
-            registry_path = _project_path(
-                arguments.registry or configured_registry
+            registry_path = (
+                project_context.resolve_path(arguments.registry)
+                if arguments.registry is not None
+                else project_context.model_registry
             )
             anomaly_thresholds, configured_confidence = load_inference_settings(
-                PROJECT_ROOT / "config.yaml"
+                project_context.configuration_path
             )
             result = run_inference(
-                _project_path(arguments.image),
+                project_context.resolve_path(arguments.image),
                 arguments.id,
                 registry_path,
                 confidence=(
@@ -289,6 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else configured_confidence
                 ),
                 anomaly_thresholds=anomaly_thresholds,
+                project_root=project_context.base_path,
             )
         except (OSError, ValueError, ModelRegistryError) as error:
             logger.error("Inference could not be started: %s", error)
@@ -297,7 +349,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         print(format_inference_result(result))
         record = create_provenance_record(
-            _project_path(arguments.image),
+            project_context.resolve_path(arguments.image),
             result,
             {
                 "confidence": result.confidence,
@@ -340,19 +392,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result.status == "VERIFIED" else 2
 
     if arguments.command == "assess":
-        image_path = _project_path(arguments.image)
+        assert project_context is not None
+        image_path = project_context.resolve_path(arguments.image)
         try:
-            configured_registry = load_model_registry_path(
-                PROJECT_ROOT / "config.yaml", PROJECT_ROOT
+            registry_path = (
+                project_context.resolve_path(arguments.registry)
+                if arguments.registry is not None
+                else project_context.model_registry
             )
-            registry_path = _project_path(
-                arguments.registry or configured_registry
-            )
-            report_directory = load_report_directory(
-                PROJECT_ROOT / "config.yaml", PROJECT_ROOT
-            )
+            report_directory = project_context.reports_directory
             anomaly_thresholds, configured_confidence = load_inference_settings(
-                PROJECT_ROOT / "config.yaml"
+                project_context.configuration_path
             )
             confidence = (
                 arguments.conf
@@ -377,6 +427,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 anomaly_thresholds=anomaly_thresholds,
                 database_settings=database_settings,
                 database_note=database_note,
+                project_root=project_context.base_path,
             )
         except (
             OSError,
@@ -404,17 +455,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if assessment.overall_status == "VERIFIED" else 2
 
     if arguments.command == "check-data":
+        assert project_context is not None
         try:
-            configured_images, configured_labels = load_dataset_paths(
-                PROJECT_ROOT / "config.yaml", PROJECT_ROOT
-            )
             result = scan_dataset(
-                _project_path(arguments.images_dir)
+                project_context.resolve_path(arguments.images_dir)
                 if arguments.images_dir is not None
-                else configured_images,
-                _project_path(arguments.labels_dir)
+                else project_context.images_directory,
+                project_context.resolve_path(arguments.labels_dir)
                 if arguments.labels_dir is not None
-                else configured_labels,
+                else project_context.labels_directory,
             )
         except (OSError, ValueError, ImageDependencyError) as error:
             logger.error("Data check could not be completed: %s", error)

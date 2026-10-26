@@ -31,7 +31,26 @@ The `src/` packages reserve space for future functionality:
 - `database/`: PostgreSQL connection and inference-evidence persistence.
 - `reports/`: local PDF assurance report generation.
 
-The CLI reads configured dataset paths, the `paths.model_registry` and `paths.reports` values, and inference/anomaly settings from `config.yaml`.
+The CLI reads project identity, configured dataset paths, the `paths.model_registry` and `paths.reports` values, and inference/anomaly settings from `config.yaml`.
+
+### Project configuration context
+
+The root `config.yaml` remains the default project configuration and uses the stable identifiers `organization_id: local` and `project_id: default`. Resource paths are resolved relative to the directory containing the selected configuration; absolute paths remain supported. To select another project, provide a configuration file with the same `project` and `paths` sections and pass `--project-config PATH` to a project-resource command:
+
+```yaml
+project:
+  organization_id: org-blue
+  project_id: road-inspection
+paths:
+  images: dataset/images
+  labels: dataset/labels
+  model_registry: models/model_registry.json
+  reports: reports
+```
+
+For example, `python assurance.py check-data --project-config projects/road/config.yaml` selects that configuration and resolves its relative resource paths from `projects/road/`. The option is supported by `check-data`, `register-model`, `verify-model`, `infer`, `assess`, and `demo-model-tampering`; existing commands without it continue using the root configuration. Relative `--registry`, `--path`, `--image`, `--images-dir`, and `--labels-dir` overrides use the selected configuration directory; absolute overrides remain absolute. The `init-db` and temporary `demo-data-integrity` commands do not use project resources and do not accept this option.
+
+The project context validates identifiers and groups resource paths for CLI selection and display. It does not authenticate users, restrict filesystem access, or create database-level project attribution: PostgreSQL schema and provenance records are unchanged in this milestone.
 
 ## Windows setup (PowerShell)
 

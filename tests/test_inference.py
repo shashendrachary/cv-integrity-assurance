@@ -1,5 +1,6 @@
 """Offline tests for image anomalies and integrity-gated YOLO inference."""
 
+import hashlib
 import json
 import shutil
 import tempfile
@@ -13,6 +14,7 @@ from PIL import Image
 from src.anomaly.checks import AnomalyThresholds, analyze_image
 from src.integrity.data_checks import sha256_file
 from src.model.integrity import register_model
+from src.project_context import load_project_context
 from src.vision.inference import run_inference
 
 
@@ -179,6 +181,58 @@ class InferenceTests(unittest.TestCase):
             conf=0.25,
             verbose=False,
         )
+
+    def test_inference_uses_selected_project_root_for_relative_model_path(self) -> None:
+        project_root = self.root / "alternative-project"
+        model_path = project_root / "models" / "relative-model.bin"
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"relative project model bytes")
+        registry_path = project_root / "models" / "model_registry.json"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "models": {
+                        "relative-model": {
+                            "model_id": "relative-model",
+                            "file_path": "models/relative-model.bin",
+                            "expected_hash": hashlib.sha256(
+                                model_path.read_bytes()
+                            ).hexdigest(),
+                            "registered_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        configuration_path = project_root / "project.yaml"
+        configuration_path.write_text(
+            "project:\n"
+            "  organization_id: test-org\n"
+            "  project_id: alternative\n"
+            "paths:\n"
+            "  images: images\n"
+            "  labels: labels\n"
+            "  model_registry: models/model_registry.json\n"
+            "  reports: reports\n",
+            encoding="utf-8",
+        )
+        context = load_project_context(configuration_path)
+        loader = self.fake_loader()
+
+        result = run_inference(
+            self.image_path,
+            "relative-model",
+            context.model_registry,
+            anomaly_thresholds=self.thresholds,
+            model_loader=loader,
+            project_root=context.base_path,
+        )
+
+        self.assertEqual(result.status, "VERIFIED")
+        self.assertEqual(result.model_verification.file_path, str(model_path.resolve()))
+        loader.assert_called_once()
 
     def test_changed_snapshot_is_rejected_before_loader(self) -> None:
         self.register_model()
