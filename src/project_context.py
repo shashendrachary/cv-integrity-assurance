@@ -27,6 +27,7 @@ class ProjectContext:
     images_directory: Path
     labels_directory: Path
     model_registry: Path
+    image_registry: Path
     reports_directory: Path
 
     def resolve_path(self, path: Path) -> Path:
@@ -164,5 +165,10 @@ def load_project_context(configuration_path: Path) -> ProjectContext:
         images_directory=resolve_resource("images"),
         labels_directory=resolve_resource("labels"),
         model_registry=resolve_resource("model_registry"),
+        image_registry=(
+            resolve_resource("image_registry")
+            if paths.get("image_registry")
+            else (base_path / "models" / "image_registry.json").resolve()
+        ),
         reports_directory=resolve_resource("reports"),
     )

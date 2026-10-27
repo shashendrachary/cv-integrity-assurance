@@ -13,6 +13,7 @@ from PIL import Image
 
 from src.anomaly.checks import AnomalyThresholds, analyze_image
 from src.integrity.data_checks import sha256_file
+from src.integrity.image_baselines import register_image
 from src.model.integrity import register_model
 from src.project_context import load_project_context
 from src.vision.inference import run_inference
@@ -28,6 +29,7 @@ class InferenceTests(unittest.TestCase):
             [255 if (x // 4 + y // 4) % 2 else 0 for y in range(48) for x in range(64)]
         )
         image.save(self.image_path)
+        register_image(self.image_path, self.root / "image_registry.json")
         self.model_path = self.root / "synthetic-model.bin"
         self.model_path.write_bytes(b"synthetic test bytes, not model weights")
         self.registry_path = self.root / "models.json"
@@ -219,6 +221,7 @@ class InferenceTests(unittest.TestCase):
             encoding="utf-8",
         )
         context = load_project_context(configuration_path)
+        register_image(self.image_path, project_root / "models" / "image_registry.json")
         loader = self.fake_loader()
 
         result = run_inference(

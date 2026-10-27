@@ -35,6 +35,7 @@ dataset/labels/*
 models/*
 !models/.gitkeep
 !models/model_registry.json
+!models/image_registry.json
 *.pt
 *.pth
 *.onnx
@@ -52,3 +53,6 @@ Thumbs.db
 
 dataset/videos/*
 !dataset/videos/.gitkeep
+
+# Local database backups
+backups/

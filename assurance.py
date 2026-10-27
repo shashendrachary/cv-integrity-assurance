@@ -23,6 +23,12 @@ from src.integrity.data_checks import (
     scan_dataset,
     sha256_file,
 )
+from src.integrity.image_baselines import (
+    ImageRegistryError,
+    format_image_verification,
+    register_image,
+    verify_image,
+)
 from src.database.postgres import (
     ConnectionSettings,
     DatabaseNotConfigured,
@@ -181,6 +187,7 @@ def run_batch_assessments(
     project_context: ProjectContext,
     assessment_runner: Callable[..., AssessmentResult] | None = None,
     logger: logging.Logger | None = None,
+    image_registry_path: Path | None = None,
 ) -> list[BatchAssessmentEntry]:
     """Assess each image without creating individual PDF reports."""
     if not image_paths:
@@ -201,6 +208,7 @@ def run_batch_assessments(
                 database_settings=database_settings,
                 database_note=database_note,
                 project_root=project_context.base_path,
+                image_registry_path=image_registry_path,
                 project_context=project_context,
                 generate_report=False,
             )
@@ -289,6 +297,14 @@ def build_batch_report_data(
         record = assessment.provenance
         reasons = tuple(dict.fromkeys([*record.reasons, *inference.reasons]))
         flags = list(inference.image_analysis.reasons)
+        image_verification = getattr(inference, "image_verification", None)
+        if (
+            image_verification is not None
+            and image_verification.status != "VERIFIED"
+        ):
+            flags.append(
+                f"Image integrity: {image_verification.status}"
+            )
         if inference.model_verification.status != "VERIFIED":
             flags.append(
                 f"Model verification: {inference.model_verification.status}"
@@ -370,6 +386,7 @@ def run_video_assessments(
         tuple[Path, Path],
     ] | None = None,
     logger: logging.Logger | None = None,
+    image_registry_path: Path | None = None,
 ) -> VideoAssessmentOutcome:
     """Assess sampled frames, then write one PDF and JSON report for the video."""
     validate_video_interval(interval_seconds)
@@ -437,6 +454,7 @@ def run_video_assessments(
                                 "skipped (video assessment does not connect to PostgreSQL)"
                             ),
                             project_root=project_context.base_path,
+                            image_registry_path=image_registry_path,
                             project_context=project_context,
                             provenance_image_path=video_path,
                             configuration_metadata={
@@ -668,6 +686,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly replace an existing trusted baseline",
     )
     add_project_config_argument(register_parser)
+    register_image_parser = commands.add_parser(
+        "register-image",
+        help="register an image file's trusted SHA-256 baseline",
+        description="Create or explicitly replace a local trusted image baseline.",
+    )
+    register_image_parser.add_argument("--image", required=True, type=Path)
+    register_image_parser.add_argument("--registry", type=Path)
+    register_image_parser.add_argument("--replace", action="store_true")
+    add_project_config_argument(register_image_parser)
     verify_parser = commands.add_parser(
         "verify-model",
         help="verify a registered model file against its baseline",
@@ -680,6 +707,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="override the registry path configured in config.yaml",
     )
     add_project_config_argument(verify_parser)
+    verify_image_parser = commands.add_parser(
+        "verify-image",
+        help="verify an image against its trusted SHA-256 baseline",
+        description="Compare an image's current SHA-256 with its trusted baseline.",
+    )
+    verify_image_parser.add_argument("--image", required=True, type=Path)
+    verify_image_parser.add_argument("--registry", type=Path)
+    add_project_config_argument(verify_image_parser)
     inference_parser = commands.add_parser(
         "infer",
         help="run integrity-gated local YOLO inference",
@@ -691,6 +726,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--conf",
         type=float,
         help="confidence threshold from 0 to 1 (default: config.yaml setting)",
+    )
+    inference_parser.add_argument(
+        "--image-registry", type=Path, help="override the configured image baseline registry"
     )
     inference_parser.add_argument(
         "--registry",
@@ -712,6 +750,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="directory of images to assess recursively",
+    )
+    batch_parser.add_argument(
+        "--image-registry", type=Path, help="override the configured image baseline registry"
     )
     batch_parser.add_argument(
         "--conf",
@@ -739,6 +780,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_video_interval,
         default=1.0,
         help="time between sampled frames in seconds (default: 1.0)",
+    )
+    video_parser.add_argument(
+        "--image-registry", type=Path, help="override the configured image baseline registry"
     )
     video_parser.add_argument(
         "--conf",
@@ -777,6 +821,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--conf",
         type=float,
         help="confidence threshold from 0 to 1 (default: config.yaml setting)",
+    )
+    assessment_parser.add_argument(
+        "--image-registry", type=Path, help="override the configured image baseline registry"
     )
     assessment_parser.add_argument(
         "--registry",
@@ -831,6 +878,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "check-data",
         "register-model",
         "verify-model",
+        "register-image",
+        "verify-image",
         "infer",
         "assess",
         "assess-batch",
@@ -892,6 +941,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         return 0
 
+    if arguments.command in {"register-image", "verify-image"}:
+        assert project_context is not None
+        registry_path = (
+            project_context.resolve_path(arguments.registry)
+            if arguments.registry is not None
+            else project_context.image_registry
+        )
+        image_path = project_context.resolve_path(arguments.image)
+        try:
+            if arguments.command == "register-image":
+                registration = register_image(
+                    image_path, registry_path, replace=arguments.replace
+                )
+                print(f"Image: {registration['file_path']}")
+                print(f"Expected SHA-256: {registration['expected_hash']}")
+                print(f"Registered at: {registration['registered_at']}")
+                return 0
+            result = verify_image(image_path, registry_path)
+            print(format_image_verification(result))
+            return 0 if result.status == "VERIFIED" else 2
+        except (OSError, ValueError, ImageRegistryError) as error:
+            logger.error("Image integrity operation failed: %s", error)
+            print(f"Image integrity operation failed: {error}", file=sys.stderr)
+            return 2
+
     if arguments.command in {"register-model", "verify-model"}:
         assert project_context is not None
         try:
@@ -939,6 +1013,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if arguments.registry is not None
                 else project_context.model_registry
             )
+            image_registry_path = (
+                project_context.resolve_path(arguments.image_registry)
+                if arguments.image_registry is not None
+                else project_context.image_registry
+            )
             anomaly_thresholds, configured_confidence = load_inference_settings(
                 project_context.configuration_path
             )
@@ -953,6 +1032,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 anomaly_thresholds=anomaly_thresholds,
                 project_root=project_context.base_path,
+                image_registry_path=image_registry_path,
             )
         except (OSError, ValueError, ModelRegistryError) as error:
             logger.error("Inference could not be started: %s", error)
@@ -966,6 +1046,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "confidence": result.confidence,
                 "device": "cpu",
+                "image_integrity": {
+                    "status": result.image_verification.status,
+                    "expected_sha256": result.image_verification.expected_hash,
+                    "actual_sha256": result.image_verification.actual_hash,
+                    "reason": result.image_verification.reason,
+                },
                 "anomaly_thresholds": {
                     "minimum_width": anomaly_thresholds.minimum_width,
                     "minimum_height": anomaly_thresholds.minimum_height,
@@ -1014,6 +1100,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if arguments.registry is not None
                 else project_context.model_registry
             )
+            image_registry_path = (
+                project_context.resolve_path(arguments.image_registry)
+                if arguments.image_registry is not None
+                else project_context.image_registry
+            )
             report_directory = project_context.reports_directory
             anomaly_thresholds, configured_confidence = load_inference_settings(
                 project_context.configuration_path
@@ -1043,6 +1134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 database_note=database_note,
                 project_root=project_context.base_path,
                 project_context=project_context,
+                image_registry_path=image_registry_path,
             )
         except (
             OSError,
@@ -1085,6 +1177,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if arguments.registry is not None
                 else project_context.model_registry
             )
+            image_registry_path = (
+                project_context.resolve_path(arguments.image_registry)
+                if arguments.image_registry is not None
+                else project_context.image_registry
+            )
             anomaly_thresholds, configured_confidence = load_inference_settings(
                 project_context.configuration_path
             )
@@ -1118,6 +1215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 database_note=database_note,
                 project_context=project_context,
                 logger=logger,
+                image_registry_path=image_registry_path,
             )
             report_items, summary = build_batch_report_data(
                 image_paths,
@@ -1156,6 +1254,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if arguments.registry is not None
                 else project_context.model_registry
             )
+            image_registry_path = (
+                project_context.resolve_path(arguments.image_registry)
+                if arguments.image_registry is not None
+                else project_context.image_registry
+            )
             anomaly_thresholds, configured_confidence = load_inference_settings(
                 project_context.configuration_path
             )
@@ -1174,6 +1277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 anomaly_thresholds=anomaly_thresholds,
                 project_context=project_context,
                 logger=logger,
+                image_registry_path=image_registry_path,
             )
         except (OSError, ValueError, ModelRegistryError, ReportGenerationError) as error:
             logger.error("Video assessment could not be completed: %s", error)

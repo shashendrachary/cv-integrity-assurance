@@ -8,6 +8,7 @@ paths:
   labels: dataset/labels
   models: models
   model_registry: models/model_registry.json
+  image_registry: models/image_registry.json
   reports: reports
   logs: logs
 

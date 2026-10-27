@@ -1,0 +1,10 @@
+{
+  "images": {
+    "c:\\users\\sr407\\onedrive\\desktop\\iv-i\\integrity-assurance\\dataset\\images\\busy_street.jpg": {
+      "expected_hash": "304843cea62c057d0d476dba5e61e7fa4eb90da76bdf0f065f60b754b75e0917",
+      "file_path": "C:\\Users\\sr407\\OneDrive\\Desktop\\IV-I\\Integrity-Assurance\\dataset\\images\\busy_street.jpg",
+      "registered_at": "2026-10-27T09:50:32.355118+00:00"
+    }
+  },
+  "schema_version": 1
+}

@@ -40,14 +40,20 @@ class AssessmentResult:
 def classify_assessment(
     inference: InferenceRunResult,
 ) -> tuple[str, list[str]]:
-    """Apply priority rules: model tampering, then incomplete/review evidence."""
+    """Apply priority rules: integrity mismatches, then incomplete/review evidence."""
     reasons = list(inference.reasons)
-    if inference.model_verification.status == "SUSPICIOUS":
+    if (
+        inference.model_verification.status == "SUSPICIOUS"
+        or inference.image_verification.status == "SUSPICIOUS"
+    ):
         return "SUSPICIOUS", reasons
 
     review_required = False
     if inference.model_verification.status != "VERIFIED":
         reasons.append("Model integrity verification is incomplete.")
+        review_required = True
+    if inference.image_verification.status != "VERIFIED":
+        reasons.append("Image integrity verification is incomplete.")
         review_required = True
     if not inference.image_analysis.valid:
         reasons.append("Input image validation did not pass.")
@@ -80,6 +86,7 @@ def run_assessment(
     database_note: str | None = None,
     model_loader: Any = None,
     project_root: Path | None = None,
+    image_registry_path: Path | None = None,
     project_context: ProjectContext | None = None,
     provenance_image_path: Path | None = None,
     configuration_metadata: dict[str, Any] | None = None,
@@ -96,6 +103,8 @@ def run_assessment(
     }
     if project_root is not None:
         inference_options["project_root"] = project_root
+    if image_registry_path is not None:
+        inference_options["image_registry_path"] = image_registry_path
     inference = inference_function(
         image_path,
         model_id,
@@ -106,6 +115,12 @@ def run_assessment(
     configuration = {
         "confidence": confidence,
         "device": "cpu",
+        "image_integrity": {
+            "status": inference.image_verification.status,
+            "expected_sha256": inference.image_verification.expected_hash,
+            "actual_sha256": inference.image_verification.actual_hash,
+            "reason": inference.image_verification.reason,
+        },
         "anomaly_thresholds": {
             "minimum_width": anomaly_thresholds.minimum_width,
             "minimum_height": anomaly_thresholds.minimum_height,

@@ -8,9 +8,11 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 from PIL import Image
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Table
 
 from src.anomaly.checks import AnomalyThresholds
 from src.database.postgres import DatabaseOperationError
+from src.integrity.image_baselines import register_image
 from src.model.integrity import register_model
 from src.provenance.workflow import classify_assessment, run_assessment
 from src.reports.pdf_report import generate_pdf_report
@@ -27,6 +29,8 @@ class AssessmentTests(unittest.TestCase):
         self.image_path = self.images / "scene.png"
         image = Image.new("RGB", (64, 48), (80, 120, 160))
         image.save(self.image_path)
+        self.image_registry_path = self.root / "image_registry.json"
+        register_image(self.image_path, self.image_registry_path)
         self.model_path = self.root / "test-model.bin"
         self.model_path.write_bytes(b"synthetic test bytes, not model weights")
         self.registry_path = self.root / "registry.json"
@@ -83,6 +87,86 @@ class AssessmentTests(unittest.TestCase):
         self.assertTrue(assessment.report_path.read_bytes().startswith(b"%PDF-"))
         self.assertEqual(assessment.provenance.run_id, assessment.report_path.stem.removeprefix("assurance-"))
         inserter.assert_called_once()
+
+    def test_image_integrity_evidence_reaches_provenance_and_pdf_for_all_statuses(self) -> None:
+        register_model("test-model", self.model_path, self.registry_path)
+        missing_baseline_registry = self.root / "missing-image-baseline.json"
+        original_image_bytes = self.image_path.read_bytes()
+        pdf_text: list[str] = []
+        original_build = SimpleDocTemplate.build
+
+        def collect_story_text(document, story, *args, **kwargs):
+            for flowable in story:
+                if isinstance(flowable, Paragraph):
+                    pdf_text.append(flowable.getPlainText())
+                elif isinstance(flowable, Table):
+                    for row in flowable._cellvalues:
+                        row_text = [
+                            cell.getPlainText()
+                            for cell in row
+                            if isinstance(cell, Paragraph)
+                        ]
+                        pdf_text.append(" | ".join(row_text))
+            return original_build(document, story, *args, **kwargs)
+
+        cases = (
+            ("VERIFIED", self.image_registry_path, None),
+            ("SUSPICIOUS", self.image_registry_path, "changed image bytes"),
+            ("REVIEW REQUIRED", missing_baseline_registry, None),
+        )
+        try:
+            with patch(
+                "reportlab.platypus.SimpleDocTemplate.build",
+                new=collect_story_text,
+            ):
+                for expected_status, image_registry, image_change in cases:
+                    with self.subTest(image_integrity=expected_status):
+                        self.image_path.write_bytes(original_image_bytes)
+                        if image_change is not None:
+                            Image.new("RGB", (64, 48), (210, 40, 90)).save(
+                                self.image_path
+                            )
+
+                        inserter = Mock()
+                        assessment = run_assessment(
+                            self.image_path,
+                            "test-model",
+                            self.registry_path,
+                            self.report_directory,
+                            confidence=0.25,
+                            anomaly_thresholds=self.thresholds,
+                            database_settings=self.database_settings,
+                            image_registry_path=image_registry,
+                            model_loader=self.create_model_loader(),
+                            record_inserter=inserter,
+                        )
+
+                        record = assessment.provenance
+                        persisted_record = inserter.call_args.args[0]
+                        image_evidence = record.configuration["image_integrity"]
+                        integrity_reason = assessment.inference.image_verification.reason
+
+                        self.assertEqual(
+                            assessment.inference.image_verification.status,
+                            expected_status,
+                        )
+                        self.assertEqual(assessment.overall_status, expected_status)
+                        self.assertEqual(record.run_status, expected_status)
+                        self.assertEqual(persisted_record.run_status, expected_status)
+                        self.assertEqual(image_evidence["status"], expected_status)
+                        self.assertEqual(image_evidence["reason"], integrity_reason)
+                        self.assertEqual(persisted_record.configuration, record.configuration)
+                        self.assertEqual(persisted_record.reasons, record.reasons)
+                        self.assertTrue(assessment.report_path.is_file())
+                        self.assertIn(f"Overall status: {expected_status}", pdf_text)
+                        self.assertIn(f"Verification | {expected_status}", pdf_text)
+                        self.assertTrue(
+                            any(integrity_reason in entry for entry in pdf_text)
+                        )
+                        if expected_status != "VERIFIED":
+                            self.assertIn(integrity_reason, record.reasons)
+        finally:
+            self.image_path.write_bytes(original_image_bytes)
 
     def test_assessment_persists_selected_project_identity(self) -> None:
         register_model("test-model", self.model_path, self.registry_path)

@@ -256,6 +256,17 @@ def generate_pdf_report(
             ("Aspect ratio", record.image_metrics.get("aspect_ratio", "Unavailable")),
         ],
     )
+    image_integrity = record.configuration.get("image_integrity", {})
+    if isinstance(image_integrity, dict):
+        add_table(
+            "Image integrity",
+            [
+                ("Verification", image_integrity.get("status", "Unavailable")),
+                ("Expected SHA-256", image_integrity.get("expected_sha256") or "Unavailable"),
+                ("Actual SHA-256", image_integrity.get("actual_sha256") or "Unavailable"),
+                ("Reason", image_integrity.get("reason", "Unavailable")),
+            ],
+        )
     add_table(
         "Model integrity",
         [

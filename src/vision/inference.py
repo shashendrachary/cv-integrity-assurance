@@ -20,6 +20,7 @@ from src.model.integrity import (
     verify_model,
 )
 from src.integrity.data_checks import sha256_file
+from src.integrity.image_baselines import ImageVerificationResult, verify_image
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class InferenceRunResult:
 
     status: str
     model_verification: ModelVerificationResult
+    image_verification: ImageVerificationResult
     image_analysis: ImageAnomalyResult
     detections: list[Detection] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
@@ -90,11 +92,14 @@ def run_inference(
     anomaly_thresholds: AnomalyThresholds | None = None,
     model_loader: ModelLoader | None = None,
     project_root: Path | None = None,
+    image_registry_path: Path | None = None,
 ) -> InferenceRunResult:
-    """Analyze an image, verify the exact registered model, then run local CPU detection."""
+    """Assess image integrity separately, then verify the model and run detection."""
     if not 0 <= confidence <= 1:
         raise ValueError("Inference confidence must be between 0 and 1.")
 
+    image_registry = image_registry_path or registry_path.with_name("image_registry.json")
+    image_verification = verify_image(image_path, image_registry)
     image_analysis = analyze_image(image_path, anomaly_thresholds)
     if not image_analysis.valid:
         review = ModelVerificationResult(
@@ -107,8 +112,9 @@ def run_inference(
         return InferenceRunResult(
             "REVIEW REQUIRED",
             review,
+            image_verification,
             image_analysis,
-            reasons=image_analysis.reasons,
+            reasons=[image_verification.reason, *image_analysis.reasons],
             confidence=confidence,
         )
 
@@ -121,8 +127,9 @@ def run_inference(
         return InferenceRunResult(
             verification.status,
             verification,
+            image_verification,
             image_analysis,
-            reasons=[str(error), *image_analysis.reasons],
+            reasons=[str(error), image_verification.reason, *image_analysis.reasons],
             confidence=confidence,
         )
 
@@ -130,8 +137,12 @@ def run_inference(
         return InferenceRunResult(
             "REVIEW REQUIRED",
             verification,
+            image_verification,
             image_analysis,
-            reasons=["Verified model registration has no model file path."],
+            reasons=[
+                "Verified model registration has no model file path.",
+                image_verification.reason,
+            ],
             confidence=confidence,
         )
 
@@ -154,8 +165,9 @@ def run_inference(
                 return InferenceRunResult(
                     "SUSPICIOUS",
                     changed,
+                    image_verification,
                     image_analysis,
-                    reasons=[changed.reason, *image_analysis.reasons],
+                    reasons=[changed.reason, image_verification.reason, *image_analysis.reasons],
                     confidence=confidence,
                 )
 
@@ -179,8 +191,9 @@ def run_inference(
                 return InferenceRunResult(
                     "SUSPICIOUS",
                     changed,
+                    image_verification,
                     image_analysis,
-                    reasons=[changed.reason, *image_analysis.reasons],
+                    reasons=[changed.reason, image_verification.reason, *image_analysis.reasons],
                     confidence=confidence,
                 )
             snapshot_verification = replace(
@@ -202,18 +215,32 @@ def run_inference(
         return InferenceRunResult(
             "REVIEW REQUIRED",
             snapshot_verification,
+            image_verification,
             image_analysis,
-            reasons=[f"Inference could not be completed: {error}", *image_analysis.reasons],
+            reasons=[
+                f"Inference could not be completed: {error}",
+                image_verification.reason,
+                *image_analysis.reasons,
+            ],
             confidence=confidence,
         )
 
-    status = "REVIEW REQUIRED" if image_analysis.reasons else "VERIFIED"
+    status = "VERIFIED"
     reasons = list(image_analysis.reasons)
+    if image_verification.status == "SUSPICIOUS":
+        status = "SUSPICIOUS"
+        reasons.insert(0, image_verification.reason)
+    elif image_verification.status != "VERIFIED":
+        status = "REVIEW REQUIRED"
+        reasons.insert(0, image_verification.reason)
+    elif image_analysis.reasons:
+        status = "REVIEW REQUIRED"
     if not detections:
         reasons.append("No objects were detected.")
     return InferenceRunResult(
         status,
         verification,
+        image_verification,
         image_analysis,
         detections,
         reasons,
@@ -228,8 +255,15 @@ def format_inference_result(result: InferenceRunResult) -> str:
     lines = [
         f"Run status: {result.status}",
         f"Model verification: {result.model_verification.status}",
+        f"Image integrity: {result.image_verification.status}",
         f"Image: {image.image_path}",
     ]
+    lines.extend(
+        (
+            f"Image expected SHA-256: {result.image_verification.expected_hash or 'unavailable'}",
+            f"Image actual SHA-256: {result.image_verification.actual_hash or 'unavailable'}",
+        )
+    )
     if image.width is not None and image.height is not None:
         lines.append(f"Dimensions: {image.width}x{image.height}")
         lines.append(f"Aspect ratio: {image.aspect_ratio:.3f}")
