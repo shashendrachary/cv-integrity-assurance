@@ -2,18 +2,29 @@
 
 import argparse
 import logging
+import math
+import os
+import stat
 import sys
+import tempfile
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Callable, Sequence
 
+import cv2
+
+from src.anomaly.checks import AnomalyThresholds, load_inference_settings
 from src.demos import run_data_integrity_demo, run_model_tampering_demo
 from src.integrity.data_checks import (
     ImageDependencyError,
+    SUPPORTED_IMAGE_EXTENSIONS,
     format_data_check,
     scan_dataset,
+    sha256_file,
 )
-from src.anomaly.checks import load_inference_settings
 from src.database.postgres import (
+    ConnectionSettings,
     DatabaseNotConfigured,
     DatabaseOperationError,
     initialize_provenance_table,
@@ -27,9 +38,17 @@ from src.model.integrity import (
     verify_model,
 )
 from src.provenance.records import create_provenance_record, insert_provenance_record
-from src.provenance.workflow import run_assessment
+from src.provenance.workflow import AssessmentResult, run_assessment
 from src.project_context import ProjectContext, ProjectContextError, load_project_context
-from src.reports.pdf_report import ReportGenerationError
+from src.reports.pdf_report import (
+    BatchImageReportItem,
+    BatchReportSummary,
+    ReportGenerationError,
+    VideoFrameReportItem,
+    VideoReportSummary,
+    generate_batch_pdf_report,
+    generate_video_pdf_report,
+)
 from src.vision.inference import format_inference_result, run_inference
 
 
@@ -50,6 +69,526 @@ IMPLEMENTED_CAPABILITIES = (
 )
 
 PLANNED_CAPABILITIES: tuple[str, ...] = ()
+
+
+class BatchImageDiscoveryError(ValueError):
+    """Raised when a batch input directory cannot be scanned usefully."""
+
+
+class VideoAssessmentError(ValueError):
+    """Raised when a video cannot be decoded or sampled safely."""
+
+
+@dataclass(frozen=True)
+class BatchAssessmentEntry:
+    """Outcome for one attempted image in a batch."""
+
+    image_path: Path
+    assessment: AssessmentResult | None = None
+    error: str | None = None
+
+    @property
+    def status(self) -> str:
+        if self.assessment is None:
+            return "FAILED"
+        return self.assessment.overall_status
+
+
+@dataclass(frozen=True)
+class VideoAssessmentOutcome:
+    """Frame totals and the one consolidated report generated for a video."""
+
+    sampled_frames: int
+    verified_frames: int
+    review_required_frames: int
+    failed_frames: int
+    report_path: Path
+    sidecar_path: Path
+
+
+def validate_video_interval(interval_seconds: float) -> None:
+    """Reject intervals that cannot represent a positive sampling period."""
+    if not math.isfinite(interval_seconds) or interval_seconds <= 0:
+        raise VideoAssessmentError("Frame interval must be a finite number greater than zero.")
+
+
+def parse_video_interval(value: str) -> float:
+    """Parse a positive finite frame interval for argparse."""
+    try:
+        interval_seconds = float(value)
+        validate_video_interval(interval_seconds)
+    except (ValueError, VideoAssessmentError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return interval_seconds
+
+
+def discover_batch_images(images_directory: Path) -> list[Path]:
+    """Return supported images recursively in deterministic path order."""
+    try:
+        directory_info = images_directory.stat()
+    except FileNotFoundError as error:
+        raise BatchImageDiscoveryError(
+            f"Images directory does not exist: {images_directory}"
+        ) from error
+    except OSError as error:
+        raise BatchImageDiscoveryError(
+            f"Unable to access images directory {images_directory}: {error}"
+        ) from error
+    if not stat.S_ISDIR(directory_info.st_mode):
+        raise BatchImageDiscoveryError(
+            f"Images path is not a directory: {images_directory}"
+        )
+
+    images: list[Path] = []
+    scan_errors: list[OSError] = []
+
+    def record_scan_error(error: OSError) -> None:
+        scan_errors.append(error)
+
+    for current_directory, directories, filenames in os.walk(
+        images_directory,
+        onerror=record_scan_error,
+    ):
+        directories.sort()
+        images.extend(
+            Path(current_directory) / filename
+            for filename in filenames
+            if Path(filename).suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        )
+
+    if scan_errors:
+        raise BatchImageDiscoveryError(
+            f"Unable to read all of images directory {images_directory}: "
+            f"{scan_errors[0]}"
+        )
+    if not images:
+        raise BatchImageDiscoveryError(
+            f"No supported images found in directory: {images_directory}"
+        )
+    return sorted(images, key=lambda image: (str(image).casefold(), str(image)))
+
+
+def run_batch_assessments(
+    image_paths: list[Path],
+    *,
+    model_id: str,
+    registry_path: Path,
+    report_directory: Path,
+    confidence: float,
+    anomaly_thresholds: AnomalyThresholds,
+    database_settings: ConnectionSettings | None,
+    database_note: str | None,
+    project_context: ProjectContext,
+    assessment_runner: Callable[..., AssessmentResult] | None = None,
+    logger: logging.Logger | None = None,
+) -> list[BatchAssessmentEntry]:
+    """Assess each image without creating individual PDF reports."""
+    if not image_paths:
+        raise ValueError("No images were supplied for batch assessment.")
+    if assessment_runner is None:
+        assessment_runner = run_assessment
+
+    entries: list[BatchAssessmentEntry] = []
+    for image_path in image_paths:
+        try:
+            assessment = assessment_runner(
+                image_path,
+                model_id,
+                registry_path,
+                report_directory,
+                confidence=confidence,
+                anomaly_thresholds=anomaly_thresholds,
+                database_settings=database_settings,
+                database_note=database_note,
+                project_root=project_context.base_path,
+                project_context=project_context,
+                generate_report=False,
+            )
+        except Exception as error:
+            if logger is not None:
+                logger.error("Batch assessment failed for %s: %s", image_path, error)
+            print(f"Image: {image_path}\nStatus: FAILED\nError: {error}")
+            entries.append(BatchAssessmentEntry(image_path, error=str(error)))
+            continue
+
+        print(f"Image: {image_path}\nStatus: {assessment.overall_status}")
+        entries.append(BatchAssessmentEntry(image_path, assessment=assessment))
+
+    return entries
+
+
+def build_batch_report_data(
+    image_paths: list[Path],
+    entries: list[BatchAssessmentEntry],
+    model_id: str,
+) -> tuple[list[BatchImageReportItem], BatchReportSummary]:
+    """Convert per-image outcomes into compact report rows and accurate totals."""
+    if not image_paths:
+        raise ValueError("No images were discovered for batch assessment.")
+    if len(entries) != len(image_paths):
+        raise ValueError("Every discovered image must have one batch result.")
+
+    hashes: list[str | None] = []
+    image_properties: list[tuple[int | None, int | None, str | None]] = []
+    for entry in entries:
+        record = entry.assessment.provenance if entry.assessment is not None else None
+        image_hash = record.image_sha256 if record is not None else None
+        if image_hash is None:
+            try:
+                image_hash = sha256_file(entry.image_path)
+            except OSError:
+                image_hash = None
+        hashes.append(image_hash)
+
+        width = height = None
+        image_format = None
+        if entry.assessment is not None:
+            metrics = entry.assessment.provenance.image_metrics
+            width = metrics.get("width")
+            height = metrics.get("height")
+        try:
+            from PIL import Image
+
+            with Image.open(entry.image_path) as image:
+                image_format = image.format
+                width = width if width is not None else image.width
+                height = height if height is not None else image.height
+        except (ImportError, OSError, ValueError):
+            pass
+        image_properties.append((width, height, image_format))
+
+    hash_counts = Counter(image_hash for image_hash in hashes if image_hash is not None)
+    report_items: list[BatchImageReportItem] = []
+    for entry, image_hash, properties in zip(entries, hashes, image_properties):
+        width, height, image_format = properties
+        assessment = entry.assessment
+        if assessment is None:
+            report_items.append(
+                BatchImageReportItem(
+                    filename=entry.image_path.name,
+                    image_sha256=image_hash,
+                    width=width,
+                    height=height,
+                    image_format=image_format,
+                    duplicate_status=(
+                        f"Duplicate ({hash_counts[image_hash]} copies)"
+                        if image_hash is not None and hash_counts[image_hash] > 1
+                        else "Unique" if image_hash is not None else "N/A"
+                    ),
+                    quality_flags=(entry.error or "Assessment failed",),
+                    status="FAILED",
+                    model_verification_status="N/A",
+                    inference_succeeded=False,
+                    reasons=(entry.error or "Assessment failed",),
+                    detections=(),
+                )
+            )
+            continue
+
+        inference = assessment.inference
+        record = assessment.provenance
+        reasons = tuple(dict.fromkeys([*record.reasons, *inference.reasons]))
+        flags = list(inference.image_analysis.reasons)
+        if inference.model_verification.status != "VERIFIED":
+            flags.append(
+                f"Model verification: {inference.model_verification.status}"
+            )
+        flags.extend(
+            reason for reason in inference.reasons if reason not in flags
+        )
+        report_items.append(
+            BatchImageReportItem(
+                filename=entry.image_path.name,
+                image_sha256=image_hash,
+                width=width,
+                height=height,
+                image_format=image_format,
+                duplicate_status=(
+                    f"Duplicate ({hash_counts[image_hash]} copies)"
+                    if image_hash is not None and hash_counts[image_hash] > 1
+                    else "Unique" if image_hash is not None else "N/A"
+                ),
+                quality_flags=tuple(flags),
+                status=assessment.overall_status,
+                model_verification_status=inference.model_verification.status,
+                inference_succeeded=inference.inference_succeeded,
+                reasons=reasons,
+                detections=tuple(record.detections),
+            )
+        )
+
+    successful_count = sum(entry.status == "VERIFIED" for entry in entries)
+    review_count = sum(entry.status == "REVIEW REQUIRED" for entry in entries)
+    failure_count = len(entries) - successful_count - review_count
+    inference_failure_count = sum(
+        entry.assessment is None
+        or not entry.assessment.inference.inference_succeeded
+        for entry in entries
+    )
+    model_statuses = sorted(
+        {
+            entry.assessment.inference.model_verification.status
+            for entry in entries
+            if entry.assessment is not None
+        }
+    )
+    model_status = (
+        model_statuses[0]
+        if len(model_statuses) == 1
+        else f"MIXED ({', '.join(model_statuses)})"
+        if model_statuses
+        else "N/A"
+    )
+    report_summary = BatchReportSummary(
+        discovered=len(image_paths),
+        processed=len(entries),
+        successful=successful_count,
+        review_required=review_count,
+        failures=failure_count,
+        inference_failures=inference_failure_count,
+        model_id=model_id,
+        model_verification_status=model_status,
+    )
+    return report_items, report_summary
+
+
+def run_video_assessments(
+    video_path: Path,
+    *,
+    interval_seconds: float,
+    model_id: str,
+    registry_path: Path,
+    report_directory: Path,
+    confidence: float,
+    anomaly_thresholds: AnomalyThresholds,
+    project_context: ProjectContext,
+    assessment_runner: Callable[..., AssessmentResult] | None = None,
+    capture_factory: Callable[[str], Any] | None = None,
+    frame_writer: Callable[[str, Any], bool] | None = None,
+    report_generator: Callable[
+        [list[VideoFrameReportItem], VideoReportSummary, Path],
+        tuple[Path, Path],
+    ] | None = None,
+    logger: logging.Logger | None = None,
+) -> VideoAssessmentOutcome:
+    """Assess sampled frames, then write one PDF and JSON report for the video."""
+    validate_video_interval(interval_seconds)
+    if not video_path.is_file():
+        raise VideoAssessmentError(
+            f"Video file does not exist or is not a file: {video_path}"
+        )
+
+    assessment_runner = assessment_runner or run_assessment
+    capture_factory = capture_factory or cv2.VideoCapture
+    frame_writer = frame_writer or cv2.imwrite
+    report_generator = report_generator or generate_video_pdf_report
+
+    try:
+        capture = capture_factory(str(video_path))
+    except Exception as error:
+        raise VideoAssessmentError(
+            f"Unable to open video {video_path}: {error}"
+        ) from error
+
+    frame_results: list[VideoFrameReportItem] = []
+    decoded_count = 0
+    try:
+        if not capture.isOpened():
+            raise VideoAssessmentError(
+                f"Video could not be opened; the file may be invalid or use an "
+                f"unsupported codec: {video_path}"
+            )
+
+        frame_rate = float(capture.get(cv2.CAP_PROP_FPS))
+        if not math.isfinite(frame_rate) or frame_rate <= 0:
+            raise VideoAssessmentError(
+                f"Video has an invalid or unsupported frame rate: {video_path}"
+            )
+
+        next_sample_time = 0.0
+        with tempfile.TemporaryDirectory(
+            prefix="assurance-video-frames-"
+        ) as temporary_directory:
+            while True:
+                has_frame, frame = capture.read()
+                if not has_frame:
+                    break
+
+                frame_time = decoded_count / frame_rate
+                if frame_time + 1e-9 >= next_sample_time:
+                    frame_index = decoded_count
+                    frame_path = (
+                        Path(temporary_directory) / f"frame-{frame_index:08d}.png"
+                    )
+                    try:
+                        if not frame_writer(str(frame_path), frame):
+                            raise VideoAssessmentError(
+                                f"Could not write sampled frame {frame_index}."
+                            )
+                        assessment = assessment_runner(
+                            frame_path,
+                            model_id,
+                            registry_path,
+                            report_directory,
+                            confidence=confidence,
+                            anomaly_thresholds=anomaly_thresholds,
+                            database_settings=None,
+                            database_note=(
+                                "skipped (video assessment does not connect to PostgreSQL)"
+                            ),
+                            project_root=project_context.base_path,
+                            project_context=project_context,
+                            provenance_image_path=video_path,
+                            configuration_metadata={
+                                "source_type": "video_frame",
+                                "video_path": str(video_path),
+                                "sampled_frame_index": frame_index,
+                                "sampled_time_seconds": frame_time,
+                                "sampling_interval_seconds": interval_seconds,
+                                "image_sha256_scope": "temporary encoded frame",
+                            },
+                            generate_report=False,
+                        )
+                        inference = assessment.inference
+                        record = assessment.provenance
+                        findings = tuple(
+                            dict.fromkeys(
+                                [
+                                    *record.reasons,
+                                    *inference.reasons,
+                                    *inference.image_analysis.reasons,
+                                ]
+                            )
+                        )
+                        frame_results.append(
+                            VideoFrameReportItem(
+                                frame_index=frame_index,
+                                time_seconds=frame_time,
+                                status=assessment.overall_status,
+                                detection_count=len(inference.detections),
+                                model_verification_status=(
+                                    inference.model_verification.status
+                                ),
+                                findings=findings,
+                                detections=tuple(record.detections),
+                            )
+                        )
+                        print(
+                            f"Frame {frame_index} at {frame_time:.3f}s: "
+                            f"{assessment.overall_status}"
+                        )
+                    except Exception as error:
+                        if logger is not None:
+                            logger.error(
+                                "Video assessment failed for frame %d at %.3fs: %s",
+                                frame_index,
+                                frame_time,
+                                error,
+                            )
+                        print(
+                            f"Frame {frame_index} at {frame_time:.3f}s: FAILED\n"
+                            f"Error: {error}"
+                        )
+                        frame_results.append(
+                            VideoFrameReportItem(
+                                frame_index=frame_index,
+                                time_seconds=frame_time,
+                                status="FAILED",
+                                detection_count=0,
+                                model_verification_status="N/A",
+                                findings=(str(error),),
+                                detections=(),
+                            )
+                        )
+                    finally:
+                        try:
+                            frame_path.unlink(missing_ok=True)
+                        except OSError as error:
+                            if logger is not None:
+                                logger.error(
+                                    "Could not remove temporary frame %s: %s",
+                                    frame_path,
+                                    error,
+                                )
+                            if frame_results and frame_results[-1].frame_index == frame_index:
+                                previous = frame_results[-1]
+                                if previous.status != "FAILED":
+                                    frame_results[-1] = VideoFrameReportItem(
+                                        frame_index=previous.frame_index,
+                                        time_seconds=previous.time_seconds,
+                                        status="FAILED",
+                                        detection_count=previous.detection_count,
+                                        model_verification_status=(
+                                            previous.model_verification_status
+                                        ),
+                                        findings=(
+                                            *previous.findings,
+                                            f"Temporary frame cleanup failed: {error}",
+                                        ),
+                                        detections=previous.detections,
+                                    )
+
+                    while next_sample_time <= frame_time + 1e-9:
+                        next_sample_time += interval_seconds
+
+                decoded_count += 1
+
+        if decoded_count == 0:
+            raise VideoAssessmentError(
+                f"Video yielded no readable frames; it may be empty, corrupt, or "
+                f"use an unsupported codec: {video_path}"
+            )
+
+        verified_count = sum(
+            result.status == "VERIFIED" for result in frame_results
+        )
+        review_count = sum(
+            result.status == "REVIEW REQUIRED" for result in frame_results
+        )
+        failed_count = len(frame_results) - verified_count - review_count
+        model_statuses = sorted(
+            {
+                result.model_verification_status
+                for result in frame_results
+                if result.model_verification_status != "N/A"
+            }
+        )
+        model_status = (
+            model_statuses[0]
+            if len(model_statuses) == 1
+            else f"MIXED ({', '.join(model_statuses)})"
+            if model_statuses
+            else "N/A"
+        )
+        report_path, sidecar_path = report_generator(
+            frame_results,
+            VideoReportSummary(
+                video_filename=video_path.name,
+                video_path=str(video_path),
+                interval_seconds=interval_seconds,
+                model_id=model_id,
+                sampled_frames=len(frame_results),
+                verified_frames=verified_count,
+                review_required_frames=review_count,
+                failed_frames=failed_count,
+                model_verification_status=model_status,
+            ),
+            report_directory,
+        )
+        return VideoAssessmentOutcome(
+            sampled_frames=len(frame_results),
+            verified_frames=verified_count,
+            review_required_frames=review_count,
+            failed_frames=failed_count,
+            report_path=report_path,
+            sidecar_path=sidecar_path,
+        )
+    except cv2.error as error:
+        raise VideoAssessmentError(
+            f"OpenCV could not decode video {video_path}: {error}"
+        ) from error
+    finally:
+        capture.release()
 
 
 def configure_logging() -> logging.Logger:
@@ -159,10 +698,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="override the registry path configured in config.yaml",
     )
     add_project_config_argument(inference_parser)
+    batch_parser = commands.add_parser(
+        "assess-batch",
+        help="assess every supported image in a directory",
+        description=(
+            "Run integrity-gated assessment, provenance persistence, and PDF "
+            "report generation for each supported image in a directory."
+        ),
+    )
+    batch_parser.add_argument("--id", required=True, help="registered model identifier")
+    batch_parser.add_argument(
+        "--images-dir",
+        type=Path,
+        required=True,
+        help="directory of images to assess recursively",
+    )
+    batch_parser.add_argument(
+        "--conf",
+        type=float,
+        help="confidence threshold from 0 to 1 (default: config.yaml setting)",
+    )
+    batch_parser.add_argument(
+        "--registry",
+        type=Path,
+        help="override the registry path configured in config.yaml",
+    )
+    add_project_config_argument(batch_parser)
+    video_parser = commands.add_parser(
+        "assess-video",
+        help="assess video frames sampled at a time interval",
+        description=(
+            "Sample video frames sequentially and run the existing integrity-gated "
+            "assessment workflow for each sampled frame."
+        ),
+    )
+    video_parser.add_argument("--id", required=True, help="registered model identifier")
+    video_parser.add_argument("--video", type=Path, required=True, help="input video path")
+    video_parser.add_argument(
+        "--interval-seconds",
+        type=parse_video_interval,
+        default=1.0,
+        help="time between sampled frames in seconds (default: 1.0)",
+    )
+    video_parser.add_argument(
+        "--conf",
+        type=float,
+        help="confidence threshold from 0 to 1 (default: config.yaml setting)",
+    )
+    video_parser.add_argument(
+        "--registry",
+        type=Path,
+        help="override the registry path configured in config.yaml",
+    )
+    add_project_config_argument(video_parser)
     commands.add_parser(
         "init-db",
-        help="create the PostgreSQL inference provenance table if absent",
-        description="Explicitly initialize the non-destructive provenance schema.",
+        help="create the legacy PostgreSQL provenance table if absent",
+        description=(
+            "Explicitly create the legacy provenance table if absent; this does "
+            "not run the project-scope migration."
+        ),
     )
     commands.add_parser(
         "migrate-db",
@@ -238,6 +833,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "verify-model",
         "infer",
         "assess",
+        "assess-batch",
+        "assess-video",
         "demo-model-tampering",
     }:
         try:
@@ -381,6 +978,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "minimum_laplacian_variance": anomaly_thresholds.minimum_laplacian_variance,
                 },
             },
+            project_context,
         )
         print(f"Provenance run ID: {record.run_id}")
         try:
@@ -388,7 +986,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if database_settings is None:
                 print(
                     "Evidence persistence: skipped (PostgreSQL is not configured). "
-                    "Set POSTGRES_DB and POSTGRES_USER or run init-db after setup."
+                    "Set POSTGRES_DB and POSTGRES_USER, then run init-db and "
+                    "explicitly migrate-db for project-scoped persistence."
                 )
             else:
                 insert_provenance_record(record, database_settings)
@@ -443,6 +1042,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 database_settings=database_settings,
                 database_note=database_note,
                 project_root=project_context.base_path,
+                project_context=project_context,
             )
         except (
             OSError,
@@ -468,6 +1068,131 @@ def main(argv: Sequence[str] | None = None) -> int:
             assessment.overall_status,
         )
         return 0 if assessment.overall_status == "VERIFIED" else 2
+
+    if arguments.command == "assess-batch":
+        assert project_context is not None
+        images_directory = project_context.resolve_path(arguments.images_dir)
+        try:
+            image_paths = discover_batch_images(images_directory)
+        except BatchImageDiscoveryError as error:
+            logger.error("Batch image discovery failed: %s", error)
+            print(f"Batch assessment failed: {error}", file=sys.stderr)
+            return 2
+
+        try:
+            registry_path = (
+                project_context.resolve_path(arguments.registry)
+                if arguments.registry is not None
+                else project_context.model_registry
+            )
+            anomaly_thresholds, configured_confidence = load_inference_settings(
+                project_context.configuration_path
+            )
+            confidence = (
+                arguments.conf
+                if arguments.conf is not None
+                else configured_confidence
+            )
+            database_note = None
+            try:
+                database_settings = load_database_settings(PROJECT_ROOT / ".env")
+            except DatabaseNotConfigured as error:
+                database_settings = None
+                database_note = (
+                    f"skipped (database configuration unavailable: {error})"
+                )
+        except (OSError, ValueError, DatabaseNotConfigured) as error:
+            logger.error("Batch assessment could not be configured: %s", error)
+            print(f"Batch assessment failed: {error}", file=sys.stderr)
+            return 2
+
+        try:
+            entries = run_batch_assessments(
+                image_paths,
+                model_id=arguments.id,
+                registry_path=registry_path,
+                report_directory=project_context.reports_directory,
+                confidence=confidence,
+                anomaly_thresholds=anomaly_thresholds,
+                database_settings=database_settings,
+                database_note=database_note,
+                project_context=project_context,
+                logger=logger,
+            )
+            report_items, summary = build_batch_report_data(
+                image_paths,
+                entries,
+                arguments.id,
+            )
+            pdf_path, sidecar_path = generate_batch_pdf_report(
+                report_items,
+                summary,
+                project_context.reports_directory,
+            )
+        except (OSError, ValueError, ReportGenerationError) as error:
+            logger.error("Consolidated batch report failed: %s", error)
+            print(f"Batch report failed: {error}", file=sys.stderr)
+            return 2
+
+        print(
+            f"Batch totals: discovered={summary.discovered}, "
+            f"processed={summary.processed}, successful={summary.successful}, "
+            f"review-required={summary.review_required}, failures={summary.failures}"
+        )
+        print(f"Consolidated PDF report: {pdf_path}")
+        print(f"Detection details: {sidecar_path}")
+        return (
+            0
+            if summary.review_required == 0 and summary.failures == 0
+            else 2
+        )
+
+    if arguments.command == "assess-video":
+        assert project_context is not None
+        video_path = project_context.resolve_path(arguments.video)
+        try:
+            registry_path = (
+                project_context.resolve_path(arguments.registry)
+                if arguments.registry is not None
+                else project_context.model_registry
+            )
+            anomaly_thresholds, configured_confidence = load_inference_settings(
+                project_context.configuration_path
+            )
+            confidence = (
+                arguments.conf
+                if arguments.conf is not None
+                else configured_confidence
+            )
+            outcome = run_video_assessments(
+                video_path,
+                interval_seconds=arguments.interval_seconds,
+                model_id=arguments.id,
+                registry_path=registry_path,
+                report_directory=project_context.reports_directory,
+                confidence=confidence,
+                anomaly_thresholds=anomaly_thresholds,
+                project_context=project_context,
+                logger=logger,
+            )
+        except (OSError, ValueError, ModelRegistryError, ReportGenerationError) as error:
+            logger.error("Video assessment could not be completed: %s", error)
+            print(f"Video assessment failed: {error}", file=sys.stderr)
+            return 2
+
+        print(
+            f"Video totals: sampled={outcome.sampled_frames}, "
+            f"successful/verified={outcome.verified_frames}, "
+            f"review-required={outcome.review_required_frames}, "
+            f"failed={outcome.failed_frames}"
+        )
+        print(f"Consolidated PDF report: {outcome.report_path}")
+        print(f"Frame details: {outcome.sidecar_path}")
+        return (
+            0
+            if outcome.review_required_frames == 0 and outcome.failed_frames == 0
+            else 2
+        )
 
     if arguments.command == "check-data":
         assert project_context is not None

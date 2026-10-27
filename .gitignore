@@ -49,3 +49,6 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+dataset/videos/*
+!dataset/videos/.gitkeep

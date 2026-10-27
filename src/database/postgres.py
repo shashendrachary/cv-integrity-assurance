@@ -202,11 +202,28 @@ def run_statement(
     parameters: tuple[Any, ...] | None = None,
     connection_factory: ConnectionFactory | None = None,
 ) -> None:
+    run_transaction(
+        settings,
+        ((statement, parameters),),
+        connection_factory=connection_factory,
+    )
+
+
+def run_transaction(
+    settings: ConnectionSettings,
+    statements: tuple[tuple[str, tuple[Any, ...] | None], ...],
+    connection_factory: ConnectionFactory | None = None,
+) -> None:
+    """Execute parameterized statements atomically on one managed connection."""
     connection = _connect(settings, connection_factory)
     try:
         cursor = connection.cursor()
         try:
-            cursor.execute(statement, parameters) if parameters is not None else cursor.execute(statement)
+            for statement, parameters in statements:
+                if parameters is not None:
+                    cursor.execute(statement, parameters)
+                else:
+                    cursor.execute(statement)
             connection.commit()
         finally:
             cursor.close()
@@ -219,7 +236,9 @@ def run_statement(
             raise
         raise DatabaseOperationError(
             "PostgreSQL operation failed; the transaction was rolled back. "
-            "Run 'python assurance.py init-db' and check database permissions."
+            "Check the database schema and permissions. If project-scoped provenance "
+            "is being written to a legacy schema, explicitly run "
+            "'python assurance.py migrate-db' after backing up the database."
         ) from error
     finally:
         connection.close()

@@ -22,6 +22,7 @@ from src.provenance.records import (
     create_provenance_record,
     insert_provenance_record,
 )
+from src.project_context import load_project_context
 from src.vision.inference import run_inference
 
 
@@ -85,6 +86,43 @@ class ProvenanceTests(unittest.TestCase):
             [1.0, 2.0, 20.0, 21.0],
         )
         self.assertEqual(json.loads(json.dumps(record.configuration)), configuration)
+        self.assertEqual(record.organization_id, "local")
+        self.assertEqual(record.project_id, "default")
+
+    def test_record_and_insert_use_selected_project_context(self) -> None:
+        configuration_path = self.root / "project.yaml"
+        configuration_path.write_text(
+            "project:\n"
+            "  organization_id: org-qa\n"
+            "  project_id: vision-test\n"
+            "paths:\n"
+            "  images: images\n"
+            "  labels: labels\n"
+            "  model_registry: registry.json\n"
+            "  reports: reports\n",
+            encoding="utf-8",
+        )
+        context = load_project_context(configuration_path)
+        record = create_provenance_record(
+            self.image_path,
+            self.make_result(),
+            {"confidence": 0.3},
+            context,
+        )
+        cursor = Mock()
+        connection = Mock()
+        connection.cursor.return_value = cursor
+
+        insert_provenance_record(
+            record,
+            {"host": "localhost", "port": 5433, "dbname": "db", "user": "user"},
+            connection_factory=Mock(return_value=connection),
+        )
+
+        statement, parameters = cursor.execute.call_args.args
+        self.assertIn("organization_id, project_id", statement)
+        self.assertIn("%s, %s", statement)
+        self.assertEqual(parameters[-2:], ("org-qa", "vision-test"))
 
     def test_missing_evidence_is_left_null(self) -> None:
         result = run_inference(
@@ -124,9 +162,48 @@ class ProvenanceTests(unittest.TestCase):
         self.assertIn("%s::jsonb", statement)
         self.assertNotIn(record.image_path, statement)
         self.assertIn(record.image_path, parameters)
+        statements = [
+            call.args[0] for call in cursor.execute.call_args_list
+        ]
+        self.assertIn("INSERT INTO organizations", statements[0])
+        self.assertIn("ON CONFLICT (organization_id) DO NOTHING", statements[0])
+        self.assertIn("INSERT INTO projects", statements[1])
+        self.assertIn(
+            "ON CONFLICT (organization_id, project_id) DO NOTHING",
+            statements[1],
+        )
+        self.assertEqual(cursor.execute.call_args_list[0].args[1], ("local",))
+        self.assertEqual(
+            cursor.execute.call_args_list[1].args[1],
+            ("local", "default"),
+        )
         self.assertIsInstance(json.loads(parameters[10]), list)
         self.assertIsInstance(json.loads(parameters[11]), dict)
+        self.assertEqual(parameters[-2:], ("local", "default"))
         connection.commit.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_project_registration_rolls_back_when_provenance_insert_fails(self) -> None:
+        record = create_provenance_record(
+            self.image_path,
+            self.make_result(),
+            {"confidence": 0.3},
+        )
+        cursor = Mock()
+        cursor.execute.side_effect = [None, None, RuntimeError("insert failed")]
+        connection = Mock()
+        connection.cursor.return_value = cursor
+
+        with self.assertRaisesRegex(DatabaseOperationError, "transaction was rolled back"):
+            insert_provenance_record(
+                record,
+                {"host": "localhost", "port": 5433, "dbname": "db", "user": "user"},
+                connection_factory=Mock(return_value=connection),
+            )
+
+        self.assertEqual(cursor.execute.call_count, 3)
+        connection.rollback.assert_called_once()
+        connection.commit.assert_not_called()
         connection.close.assert_called_once()
 
     def test_connection_failure_is_actionable_without_echoing_secrets(self) -> None:
@@ -161,6 +238,8 @@ class ProvenanceTests(unittest.TestCase):
 
         statement = cursor.execute.call_args.args[0]
         self.assertIn("CREATE TABLE IF NOT EXISTS inference_provenance", statement)
+        self.assertNotIn("organization_id", statement)
+        self.assertNotIn("project_id", statement)
         self.assertNotIn("DROP TABLE", statement)
         connection.commit.assert_called_once()
 

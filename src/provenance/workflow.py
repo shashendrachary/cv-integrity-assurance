@@ -17,6 +17,7 @@ from src.provenance.records import (
     insert_provenance_record,
 )
 from src.reports.pdf_report import generate_pdf_report
+from src.project_context import ProjectContext
 from src.vision.inference import InferenceRunResult, run_inference
 
 
@@ -33,12 +34,11 @@ class AssessmentResult:
     provenance: ProvenanceRecord
     overall_status: str
     persistence_status: str
-    report_path: Path
+    report_path: Path | None
 
 
 def classify_assessment(
     inference: InferenceRunResult,
-    persistence_succeeded: bool,
 ) -> tuple[str, list[str]]:
     """Apply priority rules: model tampering, then incomplete/review evidence."""
     reasons = list(inference.reasons)
@@ -62,9 +62,6 @@ def classify_assessment(
     if not inference.inference_succeeded:
         reasons.append("Inference did not complete successfully.")
         review_required = True
-    if not persistence_succeeded:
-        reasons.append("Optional PostgreSQL evidence persistence is unavailable.")
-        review_required = True
 
     if review_required:
         return "REVIEW REQUIRED", reasons
@@ -83,6 +80,10 @@ def run_assessment(
     database_note: str | None = None,
     model_loader: Any = None,
     project_root: Path | None = None,
+    project_context: ProjectContext | None = None,
+    provenance_image_path: Path | None = None,
+    configuration_metadata: dict[str, Any] | None = None,
+    generate_report: bool = True,
     inference_function: InferenceFunction = run_inference,
     record_inserter: RecordInserter = insert_provenance_record,
     report_generator: ReportGenerator = generate_pdf_report,
@@ -102,11 +103,29 @@ def run_assessment(
         **inference_options,
     )
 
+    configuration = {
+        "confidence": confidence,
+        "device": "cpu",
+        "anomaly_thresholds": {
+            "minimum_width": anomaly_thresholds.minimum_width,
+            "minimum_height": anomaly_thresholds.minimum_height,
+            "maximum_width": anomaly_thresholds.maximum_width,
+            "maximum_height": anomaly_thresholds.maximum_height,
+            "minimum_aspect_ratio": anomaly_thresholds.minimum_aspect_ratio,
+            "maximum_aspect_ratio": anomaly_thresholds.maximum_aspect_ratio,
+            "minimum_mean_brightness": anomaly_thresholds.minimum_mean_brightness,
+            "maximum_mean_brightness": anomaly_thresholds.maximum_mean_brightness,
+            "minimum_laplacian_variance": anomaly_thresholds.minimum_laplacian_variance,
+        },
+    }
+    if configuration_metadata is not None:
+        configuration["assessment_metadata"] = dict(configuration_metadata)
+
     persistence_status = "not saved"
     if database_settings is None:
         persistence_status = database_note or "skipped (PostgreSQL is not configured)"
     else:
-        provisional_status, provisional_reasons = classify_assessment(inference, True)
+        provisional_status, provisional_reasons = classify_assessment(inference)
         provisional_result = replace(
             inference,
             status=provisional_status,
@@ -115,49 +134,33 @@ def run_assessment(
         provisional_record = create_provenance_record(
             image_path,
             provisional_result,
-            {
-                "confidence": confidence,
-                "device": "cpu",
-                "anomaly_thresholds": {
-                    "minimum_width": anomaly_thresholds.minimum_width,
-                    "minimum_height": anomaly_thresholds.minimum_height,
-                    "maximum_width": anomaly_thresholds.maximum_width,
-                    "maximum_height": anomaly_thresholds.maximum_height,
-                    "minimum_aspect_ratio": anomaly_thresholds.minimum_aspect_ratio,
-                    "maximum_aspect_ratio": anomaly_thresholds.maximum_aspect_ratio,
-                    "minimum_mean_brightness": anomaly_thresholds.minimum_mean_brightness,
-                    "maximum_mean_brightness": anomaly_thresholds.maximum_mean_brightness,
-                    "minimum_laplacian_variance": anomaly_thresholds.minimum_laplacian_variance,
-                },
-            },
+            configuration,
+            project_context,
         )
+        if provenance_image_path is not None:
+            provisional_record = replace(
+                provisional_record,
+                image_path=str(provenance_image_path),
+            )
         try:
             record_inserter(provisional_record, database_settings)
             persistence_status = "saved to PostgreSQL"
         except DatabaseOperationError as error:
             persistence_status = f"not saved: {error}"
 
-    persistence_succeeded = persistence_status == "saved to PostgreSQL"
-    overall_status, reasons = classify_assessment(inference, persistence_succeeded)
+    # persistence_succeeded = persistence_status == "saved to PostgreSQL"
+    overall_status, reasons = classify_assessment(inference)
     final_inference = replace(inference, status=overall_status, reasons=reasons)
 
     if database_settings is None:
-        configuration = {
-            "confidence": confidence,
-            "device": "cpu",
-            "anomaly_thresholds": {
-                "minimum_width": anomaly_thresholds.minimum_width,
-                "minimum_height": anomaly_thresholds.minimum_height,
-                "maximum_width": anomaly_thresholds.maximum_width,
-                "maximum_height": anomaly_thresholds.maximum_height,
-                "minimum_aspect_ratio": anomaly_thresholds.minimum_aspect_ratio,
-                "maximum_aspect_ratio": anomaly_thresholds.maximum_aspect_ratio,
-                "minimum_mean_brightness": anomaly_thresholds.minimum_mean_brightness,
-                "maximum_mean_brightness": anomaly_thresholds.maximum_mean_brightness,
-                "minimum_laplacian_variance": anomaly_thresholds.minimum_laplacian_variance,
-            },
-        }
-        record = create_provenance_record(image_path, final_inference, configuration)
+        record = create_provenance_record(
+            image_path,
+            final_inference,
+            configuration,
+            project_context,
+        )
+        if provenance_image_path is not None:
+            record = replace(record, image_path=str(provenance_image_path))
     else:
         record = replace(
             provisional_record,
@@ -165,11 +168,15 @@ def run_assessment(
             reasons=reasons,
         )
 
-    report_path = report_generator(
-        record,
-        overall_status,
-        persistence_status,
-        report_directory,
+    report_path = (
+        report_generator(
+            record,
+            overall_status,
+            persistence_status,
+            report_directory,
+        )
+        if generate_report
+        else None
     )
     return AssessmentResult(
         inference,

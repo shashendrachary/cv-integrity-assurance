@@ -12,9 +12,10 @@ from typing import Any, Callable
 from src.database.postgres import (
     ConnectionFactory,
     ConnectionSettings,
-    run_statement,
+    run_transaction,
 )
 from src.integrity.data_checks import sha256_file
+from src.project_context import ProjectContext
 from src.vision.inference import InferenceRunResult
 
 
@@ -38,12 +39,15 @@ class ProvenanceRecord:
     run_status: str
     inference_succeeded: bool
     reasons: list[str]
+    organization_id: str = "local"
+    project_id: str = "default"
 
 
 def create_provenance_record(
     image_path: Path,
     result: InferenceRunResult,
     configuration: dict[str, Any],
+    project_context: ProjectContext | None = None,
 ) -> ProvenanceRecord:
     """Build a provenance record, leaving unavailable evidence as null."""
     try:
@@ -86,6 +90,10 @@ def create_provenance_record(
         run_status=result.status,
         inference_succeeded=result.inference_succeeded,
         reasons=list(result.reasons),
+        organization_id=(
+            project_context.organization_id if project_context else "local"
+        ),
+        project_id=project_context.project_id if project_context else "default",
     )
 
 
@@ -100,10 +108,10 @@ def insert_provenance_record(
             run_id, recorded_at, image_path, image_sha256, model_id, model_path,
             model_expected_sha256, model_actual_sha256, model_verification_status,
             confidence, detections, image_metrics, configuration, run_status,
-            inference_succeeded, reasons
+            inference_succeeded, reasons, organization_id, project_id
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s::jsonb
+            %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s::jsonb, %s, %s
         )
     """
     parameters = (
@@ -123,10 +131,29 @@ def insert_provenance_record(
         record.run_status,
         record.inference_succeeded,
         json.dumps(record.reasons),
+        record.organization_id,
+        record.project_id,
     )
-    run_statement(
+    run_transaction(
         settings,
-        statement,
-        parameters,
+        (
+            (
+                """
+                INSERT INTO organizations (organization_id)
+                VALUES (%s)
+                ON CONFLICT (organization_id) DO NOTHING
+                """,
+                (record.organization_id,),
+            ),
+            (
+                """
+                INSERT INTO projects (organization_id, project_id)
+                VALUES (%s, %s)
+                ON CONFLICT (organization_id, project_id) DO NOTHING
+                """,
+                (record.organization_id, record.project_id),
+            ),
+            (statement, parameters),
+        ),
         connection_factory=connection_factory,
     )
